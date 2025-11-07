@@ -1,0 +1,253 @@
+---
+title: "Análise TCC - IDEB e PIB"
+author: "Vinicius Santana"
+date: "2025-10-24"
+output: html_document
+---
+
+```{r Limpeza de memória}
+
+rm(list = ls())
+```
+
+```{r Biblioteca}
+
+# Gerenciador de pacotes para facilitar a instalação e o carregamento
+if (!require("pacman")) install.packages("pacman")
+
+# Carregar todos os pacotes necessários para a análise
+pacman::p_load(
+  basedosdados, # Para baixar dados públicos brasileiros
+  knitr,        # Para formatar tabelas
+  DHARMa,       # Para diagnóstico de modelos
+  boot          # Para análise de bootstrap
+)
+
+```
+
+```{r Aquisição e Preparação dos Dados}
+# Defina seu ID de projeto do Google Cloud
+set_billing_id("meu-tcc-vinicius")
+
+# Query para buscar os dados consolidados por estado (UF)
+query_estados <- "
+SELECT
+  ideb.sigla_uf,
+  ideb.ideb,
+  (pib.pib / pop.populacao) AS pib_per_capita
+FROM
+  `basedosdados.br_inep_ideb.uf` AS ideb
+JOIN
+  `basedosdados.br_ibge_pib.uf` AS pib ON ideb.sigla_uf = pib.sigla_uf AND ideb.ano = pib.ano
+JOIN
+  `basedosdados.br_ibge_populacao.uf` AS pop ON ideb.sigla_uf = pop.sigla_uf AND ideb.ano = pop.ano
+WHERE
+  ideb.ano = 2019 AND ideb.rede = 'publica' AND ideb.anos_escolares = 'iniciais (1-5)'
+"
+
+# Executa a query e baixa os dados
+dados_estados_tcc <- read_sql(query_estados)
+
+# Limpeza e transformação dos dados
+dados_estados_tcc <- na.omit(dados_estados_tcc)
+dados_estados_tcc$ideb_prop <- dados_estados_tcc$ideb / 10
+
+# Rescalar a variável explicativa para estabilidade numérica
+dados_estados_tcc$pib_per_capita_scaled <- dados_estados_tcc$pib_per_capita / 1000
+
+cat("Dados prontos para análise (n=27):\n")
+kable(head(dados_estados_tcc))
+```
+
+```{r Funções de Apoio do Modelo}
+# Log-Verossimilhança (versão negativa para otimização)
+log_ver_neg <- function(beta, y_obs, x_obs) {
+  eta    <- x_obs %*% beta
+  mu     <- exp(eta) / (1 + exp(eta))
+  mu     <- pmin(pmax(mu, .Machine$double.eps), 1 - .Machine$double.eps)
+  l_beta <- sum(2 * log(1 - mu) - log(mu) - 3 * log(1 - y_obs) - (y_obs * (1 - mu)) / (mu * (1 - y_obs)))
+  return(-l_beta)
+}
+
+# Log-Verossimilhança (versão positiva para cálculos de AIC/RV)
+log_ver_pos <- function(beta, y_obs, x_obs) {
+  return(-log_ver_neg(beta, y_obs, x_obs))
+}
+
+# Matriz de Informação de Fisher
+get_fisher_info_matrix <- function(beta, x_obs) {
+  eta     <- x_obs %*% beta
+  mu      <- as.vector(exp(eta) / (1 + exp(eta)))
+  h_linha <- as.vector(exp(eta) / ((1 + exp(eta))^2))
+  q_diag  <- ((1 + 2*mu - mu^2) / (mu^2 * (1-mu)^2)) * h_linha^2
+  Q       <- diag(q_diag)
+  I_Fisher <- t(x_obs) %*% Q %*% x_obs
+  return(I_Fisher)
+}
+
+# Inversa da Matriz de Informação de Fisher
+Inv_I_Fisher <- function(vP1, X){
+  I_Fisher <- get_fisher_info_matrix(vP1, X)
+  return(solve(I_Fisher))
+}
+
+# Vetor Escore
+get_score_vector <- function(beta, y_obs, x_obs) {
+  eta     <- x_obs %*% beta
+  mu      <- as.vector(exp(eta) / (1 + exp(eta)))
+  h_linha <- as.vector(exp(eta) / ((1 + exp(eta))^2))
+  v       <- (y_obs*(1-mu) - mu*(1+mu)*(1-y_obs)) / (mu^2*(1-mu)*(1-y_obs)) * h_linha
+  U       <- t(x_obs) %*% v
+  return(U)
+}
+
+
+# Função do Teste Escore (versão estável)
+Escore_Test_Corrected <- function(beta_tilde, X, Y, q_params) {
+  U_tilde_full <- get_score_vector(beta_tilde, Y, X)
+  U_1_tilde <- U_tilde_full[1:q_params, 1, drop = FALSE]
+
+  I_tilde <- get_fisher_info_matrix(beta_tilde, X)
+  Inv_I_tilde <- solve(I_tilde)
+  I_tilde_11_submatrix <- Inv_I_tilde[1:q_params, 1:q_params, drop = FALSE]
+
+  Escore_stat <- t(U_1_tilde) %*% I_tilde_11_submatrix %*% U_1_tilde
+  return(as.numeric(Escore_stat))
+}
+
+# Função da Matriz de Covariância de 2ª Ordem (para Wald Corrigido)
+Cov_2_Matricial <- function(beta_hat, X, p, n){
+  eta_hat       <- X %*% beta_hat
+  mi_hat        <- as.vector(exp(eta_hat) / (exp(eta_hat) + 1))
+  h_linha_hat   <- as.vector(exp(eta_hat) / ((exp(eta_hat) + 1)^2))
+  h2_linhas_hat <- as.vector((exp(eta_hat) * (1 - exp(eta_hat))) / ((exp(eta_hat) + 1)^3))
+  h3_linhas_hat <- as.vector((exp(eta_hat) / (1 + exp(eta_hat))^4) * (1 - 4*exp(eta_hat) + exp(2*eta_hat)))
+  Inv_I_Fisher_hat <- Inv_I_Fisher(beta_hat, X)
+  
+  t_vec <- numeric(n); w_vec <- numeric(n); u_vec <- numeric(n); nu_vec <- numeric(n)
+  A <- matrix(0,n,n); B <- matrix(0,n,n)
+  
+  for (i in 1:n) {
+    t_vec[i] <- ((-20*mi_hat[i]^2 + 8*mi_hat[i])/(mi_hat[i]^4*(1-mi_hat[i])^4))*h_linha_hat[i]^4 + ((2*mi_hat[i]^3-6*mi_hat[i]^2-14*mi_hat[i]+2)/(mi_hat[i]^3*(1-mi_hat[i])^3))*(h_linha_hat[i]^2*h2_linhas_hat[i]) + ((mi_hat[i]^2-2*mi_hat[i]-1)/(mi_hat[i]^2*(1-mi_hat[i])^2))*(h2_linhas_hat[i]^2+h_linha_hat[i]*h3_linhas_hat[i]) + ((1+2*mi_hat[i]-mi_hat[i]^2)/(mi_hat[i]^2*(1-mi_hat[i])^2))*((2/mi_hat[i])*h_linha_hat[i]^2-h2_linhas_hat[i])^2
+    w_vec[i] <- 2*((mi_hat[i]^3-3*mi_hat[i]^2-mi_hat[i]+1)/(mi_hat[i]^3*(1-mi_hat[i])^3))*h_linha_hat[i]^3 + 2*((mi_hat[i]^2-2*mi_hat[i]-1)/(mi_hat[i]^2*(1-mi_hat[i])^2))*h_linha_hat[i]*h2_linhas_hat[i]
+    u_vec[i] <- (((mi_hat[i]^2-2*mi_hat[i]-1)/(mi_hat[i]^2*(1-mi_hat[i])^2))*((2/mi_hat[i])*h_linha_hat[i]^2-h2_linhas_hat[i])*h_linha_hat[i])
+    nu_vec[i] <- (4*(mi_hat[i]^3-3*mi_hat[i]^2+1)/(mi_hat[i]^3*(1-mi_hat[i])^3))*h_linha_hat[i]^3 + (3*(mi_hat[i]^2-2*mi_hat[i]-1)/(mi_hat[i]^2*(1-mi_hat[i])^2))*h_linha_hat[i]*h2_linhas_hat[i]
+  }
+  
+  for (i in 1:n) {
+    for (j in 1:n) {
+      A[i,j] <- nu_vec[i] * (3 * nu_vec[j] + 10 * u_vec[j]) + 6 * u_vec[i] * u_vec[j]
+      B[i,j] <- w_vec[i] * (w_vec[j] + u_vec[j])
+    }
+  }
+  
+  T_1_diag <- diag(t_vec)
+  Z_matrix <- X %*% Inv_I_Fisher_hat %*% t(X)
+  Z_D_diag <- diag(diag(Z_matrix))
+  
+  gama_1 <- -t(X) %*% T_1_diag %*% Z_D_diag %*% X
+  gama_2 <- t(X) %*% (A * Z_matrix * Z_matrix) %*% X
+  M_1_ones <- matrix(1, n, p)
+  gama_3 <- t(X) %*% ((B * (Z_matrix %*% Z_D_diag)) %*% M_1_ones * X)
+  
+  Gama_hat <- -0.5*gama_1 + 0.25*gama_2 + 0.5*gama_3
+  Cov_hat  <- Inv_I_Fisher_hat + Inv_I_Fisher_hat %*% (Gama_hat + t(Gama_hat)) %*% Inv_I_Fisher_hat
+  
+  return(Cov_hat)
+}
+```
+
+```{r Preparação e Ajuste do Modelo Irrestrito}
+Y <- dados_estados_tcc$ideb_prop
+X <- model.matrix(~ pib_per_capita_scaled, data = dados_estados_tcc)
+
+n <- nrow(X)
+p <- ncol(X)
+
+start_vals <- coef(lm(log(Y / (1 - Y)) ~ pib_per_capita_scaled, data = dados_estados_tcc))
+
+fit_UL_estados <- optim(
+  par = start_vals,
+  fn = log_ver_neg,
+  y_obs = Y,
+  x_obs = X,
+  method = "BFGS",
+  hessian = TRUE 
+)
+
+beta_hat <- fit_UL_estados$par
+names(beta_hat) <- colnames(X)
+
+q <- 1
+psi_H0 <- 0
+
+
+### Cálculo das 5 Estatísticas de Teste
+
+
+# Teste de Wald (W)
+stat_W <- (beta_hat[2] / sqrt(solve(fit_UL_estados$hessian)[2,2]))^2
+pval_W <- pchisq(stat_W, df = q, lower.tail = FALSE)
+
+# Teste de Wald Corrigido (Wc)
+cov_matrix_2nd <- Cov_2_Matricial(beta_hat, X, p, n)
+stat_Wc <- t(beta_hat[2]-psi_H0) %*% solve(cov_matrix_2nd[2,2,drop=F]) %*% (beta_hat[2]-psi_H0)
+pval_Wc <- pchisq(stat_Wc, df = q, lower.tail = FALSE)
+
+# Teste da Razão de Verossimilhanças (RV)
+loglik_irrestrito <- log_ver_pos(beta_hat, Y, X)
+X_restr <- X[, 1, drop = FALSE]
+fit_restr <- optim(par = start_vals[1], fn = log_ver_neg, y_obs = Y, x_obs = X_restr, method="BFGS")
+loglik_restrito <- -fit_restr$value
+stat_RV <- 2 * (loglik_irrestrito - loglik_restrito)
+pval_RV <- pchisq(stat_RV, df = q, lower.tail = FALSE)
+
+# Teste Escore (E)
+beta_restr <- c(fit_restr$par, 0)
+X_reordered <- X[, c(2, 1)]
+beta_restr_reordered <- c(0, fit_restr$par)
+stat_E <- Escore_Test_Corrected(beta_tilde = beta_restr_reordered, X = X_reordered, Y = Y, q_params = q)
+pval_E <- pchisq(stat_E, df = q, lower.tail = FALSE)
+
+# Teste Gradiente (G)
+U_restr <- get_score_vector(beta_restr, Y, X)
+stat_G <- t(beta_hat[2] - psi_H0) %*% U_restr[2, 1, drop=F]
+pval_G <- pchisq(stat_G, df = q, lower.tail = FALSE)
+```
+
+```{r Tabela de Resultados do Ajuste}
+cov_matrix_wald <- solve(fit_UL_estados$hessian)
+se_wald <- sqrt(diag(cov_matrix_wald))
+z_value_wald <- beta_hat / se_wald
+p_value_wald <- 2 * pnorm(abs(z_value_wald), lower.tail = FALSE)
+
+tabela_ajuste <- data.frame(
+  `Termo` = colnames(X),
+  `Estimativa` = beta_hat,
+  `Erro Padrão` = se_wald,
+  `Valor z` = z_value_wald,
+  `Pr(>|z|)` = p_value_wald,
+  check.names = FALSE
+)
+
+cat("Tabela 1: Resultados do Ajuste do Modelo Lindley-Unitária\n")
+kable(tabela_ajuste, caption = "Resultados do Ajuste do Modelo Lindley-Unitária para o IDEB", digits = 4)
+
+
+
+# Tabela Comparativa dos Testes de Hipóteses
+
+tabela_comparativa_testes <- data.frame(
+  `Estatística de Teste` = c("Wald (W)", "Wald Corrigido (Wc)", "Razão de Verossimilhanças (RV)", "Escore (E)", "Gradiente (G)"),
+  `Valor Calculado` = c(stat_W, stat_Wc, stat_RV, stat_E, stat_G),
+  `Graus de Liberdade (q)` = rep(q, 5),
+  `Valor-p` = c(pval_W, pval_Wc, pval_RV, pval_E, pval_G),
+  check.names = FALSE
+)
+
+cat("\n\nTabela 2: Comparação dos Testes de Hipóteses\n")
+kable(tabela_comparativa_testes, 
+      caption = "Comparação dos Testes de Hipóteses para o Efeito do PIB per capita no IDEB", 
+      digits = 4)
+```
+

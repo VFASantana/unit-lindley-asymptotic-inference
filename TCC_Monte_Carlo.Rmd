@@ -1,0 +1,570 @@
+---
+title: "Análise TCC - Monte Carlo / Viés"
+author: "Vinicius Santana"
+date: "2025-02-28"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r Limpeza de memória}
+
+rm(list = ls())
+```
+
+```{r Biblioteca}
+
+# Instalar o pacote pacman
+if (!require("pacman")) install.packages("pacman")
+
+# Carregar os pacotes 
+pacman::p_load(
+  xtable,
+  MASS,
+  numDeriv,
+  progress,
+  parallel
+)
+
+```
+
+```{r Parametrizações}
+# Numero de replicas de Monte Carlo
+REP = 100000
+
+## Numero de parametros ## p = 2 , 3 , 4 , 5 , 6
+p = 6
+
+## Numero de parametros testados ## q = 1 , 2
+q = 2
+
+## Definição de psi_H0
+psi_H0 = rep(0,q)
+
+# Lista de vetores de parâmetros verdadeiros
+if (p == 2 && q == 1) {
+  beta_verd = matrix(c(0, -2), p, 1)
+}
+if (p == 3 && q == 1) {
+  beta_verd = matrix(c(0, -2, 1), p, 1)
+}
+if (p == 4 && q == 1) {
+  beta_verd = matrix(c(0, -2, 1, 0.5), p, 1)
+}
+if (p == 5 && q == 1) {
+  beta_verd = matrix(c(0, 1, 1, 5, -4), p, 1)
+}
+if (p == 6 && q == 1) {
+  beta_verd = matrix(c(0, -2, 1, 0.5, 0.5, 1.5), p, 1)
+}
+
+### Quando q = 2
+if (p == 3 && q == 2) {
+  beta_verd = matrix(c(0, 0, -2), p, 1)
+}
+if (p == 4 && q == 2) {
+  beta_verd = matrix(c(0, 0, -2, 1), p, 1)
+}
+if (p == 5 && q == 2) {
+  beta_verd = matrix(c(0, 0, 1, 1, 5), p, 1)
+}
+if (p == 6 && q == 2) {
+  beta_verd = matrix(c(0, 0, -2, 1, 0.5, 0.5), p, 1)
+}
+```
+
+```{r Lindley Manualmente}
+rlindley_manual <- function(n, theta, mixture = TRUE)
+{
+  stopifnot(theta > 0)
+  if(mixture)
+  {
+    x <- rbinom(n, size = 1, prob = theta / (1 + theta))
+    x * rgamma(n, shape = 1, rate = theta) + (1 - x) * rgamma(n, shape = 2, rate = theta)
+  }
+  else
+  {
+    qlindley(p = runif(n), theta, lower.tail = TRUE, log.p = FALSE)
+  }
+}
+```
+
+```{r Cálculo dos quantis}
+
+quantil90 = qchisq(0.90,q)
+quantil95 = qchisq(0.95,q)
+quantil99 = qchisq(0.99,q)
+```
+
+```{r Função Log_Verossimilhança a ser maximizada}
+
+log_ver = function(beta){
+  
+  eta    = X%*%beta
+  mi     = exp(eta)/(exp(eta) + 1)
+  l_beta = sum(2*log(1-mi) - log(mi) - 3*log(1 - Y) - (Y*(1-mi))/(mi*(1-Y)))
+    
+  return(-l_beta)
+  
+}
+
+```
+
+```{r Log_Verossimilhança restrita}
+
+log_ver_restricted <- function(beta_2_optim_params, q_local, psi_H0_local, p_local) {
+  beta_completo_tilde <- numeric(p_local)
+  beta_completo_tilde[1:q_local] <- psi_H0_local
+  
+  if (p_local > q_local) {
+    beta_completo_tilde[(q_local + 1):p_local] <- beta_2_optim_params
+  }
+  
+  return(log_ver(beta_completo_tilde)) 
+}
+```
+
+```{r Inversa da informação de Fisher}
+
+Inv_I_Fisher = function(vP1, X){
+  
+  beta     = vP1
+  eta      = X%*%beta
+  mi       = exp(eta)/(exp(eta)+1)
+  h_linha  = exp(eta)/((exp(eta)+1)^2)
+  vP       =  ((1 + 2*mi - mi^2)/(mi^2*(1-mi)^2))*(h_linha^2)
+  P        = diag(c(vP))
+  I_Fisher      = t(X)%*%P%*%X
+  Inv_I_Fisher  = solve(I_Fisher)
+  
+  return(Inv_I_Fisher)
+}
+
+```
+
+```{r Covariância dee segunda ordem, eval = FALSE}
+Cov_2_Matricial = function(vP1, X, p, n){
+  
+  beta_hat      = vP1
+  eta_hat       = X%*%beta_hat
+  mi_hat        = exp(eta_hat)/(exp(eta_hat)+1)
+  h_linha_hat   = exp(eta_hat)/((exp(eta_hat)+1)^2)
+  h2_linhas_hat = (exp(eta_hat) * (1 - exp(eta_hat))) / ((exp(eta_hat) + 1)^3)
+  h3_linhas_hat = (exp(eta_hat) / (1 + exp(eta_hat))^4) * (1 - 4 * exp(eta_hat) + exp(2 * eta_hat)) 
+  Inv_I_Fisher_hat = Inv_I_Fisher(beta_hat, X) 
+  
+
+  t_vec    = numeric(n) 
+  w_vec    = numeric(n)
+  u_vec    = numeric(n) 
+  nu_vec   = numeric(n) 
+
+  A = matrix(0,n,n) 
+  B = matrix(0,n,n) 
+  
+  for (i in 1:n)
+  {
+  
+    term1_ti = ((-20 * mi_hat[i]^2 + 8 * mi_hat[i]) / (mi_hat[i]^4 * (1 - mi_hat[i])^4)) * h_linha_hat[i]^4
+    term2_ti = ((2 * mi_hat[i]^3 - 6 * mi_hat[i]^2 - 14 * mi_hat[i] + 2) / (mi_hat[i]^3 * (1 - mi_hat[i])^3)) * h_linha_hat[i]^2 * h2_linhas_hat[i]
+    term3_ti = ((mi_hat[i]^2 - 2 * mi_hat[i] - 1) / (mi_hat[i]^2 * (1 - mi_hat[i])^2)) * (h2_linhas_hat[i]^2 + h_linha_hat[i] * h3_linhas_hat[i])
+    term4_ti = ((1 + 2 * mi_hat[i] - mi_hat[i]^2) / (mi_hat[i]^2 * (1 - mi_hat[i])^2)) * ((2 / mi_hat[i]) * h_linha_hat[i]^2 - h2_linhas_hat[i])^2
+    t_vec[i] = term1_ti + term2_ti + term3_ti + term4_ti
+    
+  
+    w_vec[i] = 2 * ((mi_hat[i]^3 - 3 * mi_hat[i]^2 - mi_hat[i] + 1) / (mi_hat[i]^3 * (1 - mi_hat[i])^3)) * h_linha_hat[i]^3 + 
+               2 * ((mi_hat[i]^2 - 2 * mi_hat[i] - 1) / (mi_hat[i]^2 * (1 - mi_hat[i])^2)) * h_linha_hat[i] * h2_linhas_hat[i]
+               
+   
+    u_vec[i] = (((mi_hat[i]^2 - 2 * mi_hat[i] - 1) / (mi_hat[i]^2 * (1 - mi_hat[i])^2)) * ((2 / mi_hat[i]) * h_linha_hat[i]^2 - h2_linhas_hat[i]) * h_linha_hat[i])
+
+   
+    nu_vec[i] = (4 * (mi_hat[i]^3 - 3 * mi_hat[i]^2 + 1) / (mi_hat[i]^3 * (1 - mi_hat[i])^3)) * h_linha_hat[i]^3 +
+                (3 * (mi_hat[i]^2 - 2 * mi_hat[i] - 1) / (mi_hat[i]^2 * (1 - mi_hat[i])^2)) * h_linha_hat[i] * h2_linhas_hat[i]
+  }
+  
+  for (i in 1:n)
+  {
+    for (j in 1:n)
+    {
+      
+      A[i,j] = (nu_vec[i]) * (3 * nu_vec[j] + 10 * u_vec[j]) + 6 * u_vec[i] * u_vec[j]
+      
+    
+      B[i,j] = w_vec[i] * (w_vec[j] + u_vec[j])
+    }
+  }
+  
+  T_1_diag_matrix = diag(t_vec) 
+  Z_matrix = X %*% Inv_I_Fisher_hat %*% t(X)
+  
+  Z_D_diag_matrix = diag(diag(Z_matrix)) 
+  
+  gama_1_hat = -t(X) %*% T_1_diag_matrix %*% Z_D_diag_matrix %*% X
+  
+  gama_2_hat = t(X) %*% (A * Z_matrix * Z_matrix) %*% X
+  
+  
+  M_1_ones_matrix = matrix(1, n, p) 
+  term_for_gama3 = (B * (Z_matrix %*% Z_D_diag_matrix)) %*% M_1_ones_matrix * X 
+  gama_3_hat = t(X) %*% term_for_gama3
+  
+  # Combinação para Gama_hat (Gamma na dissertação)
+  Gama_hat = -0.5 * gama_1_hat + 0.25 * gama_2_hat + 0.5 * gama_3_hat
+  
+  # Matriz de covariância de segunda ordem
+  Cov_hat = Inv_I_Fisher_hat + Inv_I_Fisher_hat %*% (Gama_hat + t(Gama_hat)) %*% Inv_I_Fisher_hat
+  
+  return(Cov_hat)
+}
+```
+
+```{r Estatística de Wald}
+
+Wald = function(vP1, X, p, psi_H0){
+  
+  beta_hat         = vP1
+  psi_hat          = beta_hat[1:q]
+  Inv_I_Fisher_hat = Inv_I_Fisher(beta_hat, X)
+  
+  W = t(psi_hat - psi_H0)%*%solve(Inv_I_Fisher_hat[1:q,1:q])%*%(psi_hat - psi_H0)
+  
+  return(W)
+
+}
+
+```
+
+```{r Estatística da Razão de Verossimilhança}
+
+Likeli_ratio_test_corrigida <- function(beta_hat_irrestrito, beta_tilde_restrito, X, Y) {
+
+  eta_H1 <- X %*% beta_hat_irrestrito
+  mu_H1 <- exp(eta_H1) / (1 + exp(eta_H1))
+  
+  #log-verossimilhança
+  logL_H1 <- sum(2 * log(1 - mu_H1) - log(mu_H1) - 3 * log(1 - Y) - (Y * (1 - mu_H1)) / (mu_H1 * (1 - Y)), na.rm = TRUE)
+
+  #Cálculo da Log-Verossimilhança sob H0 (modelo restrito) 
+  eta_H0 <- X %*% beta_tilde_restrito
+  mu_H0 <- exp(eta_H0) / (1 + exp(eta_H0))
+  
+  logL_H0 <- sum(2 * log(1 - mu_H0) - log(mu_H0) - 3 * log(1 - Y) - (Y * (1 - mu_H0)) / (mu_H0 * (1 - Y)), na.rm = TRUE)
+
+  #Estatística da Razão de Verossimilhança 
+  LR <- 2 * (logL_H1 - logL_H0)
+  
+  # Pequena verificação para evitar LR negativo devido a precisão numérica ou falha na otimização
+  if (LR < 0) {
+    LR <- max(0, LR) 
+  }
+  
+  return(as.numeric(LR))
+}
+
+```
+
+```{r Estatistica Escore}
+
+Escore_Test_Corrected <- function(beta_tilde, X, Y, q_params_of_interest) {
+  eta_tilde <- X %*% beta_tilde      
+  mi_tilde <- exp(eta_tilde) / (1 + exp(eta_tilde))
+  h_linha_tilde <- exp(eta_tilde) / ((1 + exp(eta_tilde))^2) 
+
+  v_numerator <- Y * (1 - mi_tilde) - mi_tilde * (1 + mi_tilde) * (1 - Y)
+  v_denominator <- mi_tilde^2 * (1 - mi_tilde) * (1 - Y) 
+  v_tilde_components <- v_numerator / v_denominator
+  v_tilde <- v_tilde_components * h_linha_tilde
+  U_tilde_full <- t(X) %*% v_tilde  
+  U_1_tilde <- U_tilde_full[1:q_params_of_interest, 1, drop = FALSE]
+  q_tilde_diag_elements <- ((1 + 2 * mi_tilde - mi_tilde^2) / (mi_tilde^2 * (1 - mi_tilde)^2)) * h_linha_tilde^2
+  Q_tilde <- diag(as.vector(q_tilde_diag_elements))
+  I_tilde <- t(X) %*% Q_tilde %*% X
+  Inv_I_Fisher_tilde_matrix <- solve(I_tilde)
+  I_tilde_beta1_beta1 <- Inv_I_Fisher_tilde_matrix[1:q_params_of_interest, 1:q_params_of_interest, drop = FALSE]
+  Escore <- t(U_1_tilde) %*% I_tilde_beta1_beta1 %*% U_1_tilde
+  
+  return(as.numeric(Escore))
+}
+```
+
+```{r Estatistica Gradiente}
+
+Gradiente_Test_Corrected <- function(beta_hat_unrestricted, beta_tilde_restricted, X, Y, q_params, psi_H0_val) {
+
+
+  psi_hat <- beta_hat_unrestricted[1:q_params, drop = FALSE] 
+  eta_tilde <- X %*% beta_tilde_restricted
+  mi_tilde <- exp(eta_tilde) / (1 + exp(eta_tilde))
+  h_linha_tilde <- exp(eta_tilde) / ((1 + exp(eta_tilde))^2)
+  
+  # Componentes do vetor v (avaliados em tilde) 
+  v_tilde_components <- (Y * (1 - mi_tilde) - mi_tilde * (1 + mi_tilde) * (1 - Y)) / 
+                        (mi_tilde^2 * (1 - mi_tilde) * (1 - Y))
+  v_for_U_tilde <- v_tilde_components * h_linha_tilde
+  
+  # Vetor de Escore completo U(\tilde{\beta}) 
+  U_full_at_tilde <- t(X) %*% v_for_U_tilde 
+  
+  # Parte do vetor de escore correspondente a beta_1, U_1(\tilde{\beta}) 
+  U_1_at_tilde <- U_full_at_tilde[1:q_params, 1, drop = FALSE] 
+
+  # Estatística Gradiente
+  G_stat <- t(psi_hat - psi_H0_val) %*% U_1_at_tilde
+  
+  return(as.numeric(G_stat))
+}
+
+```
+
+```{r Simulação, eval = FALSE}
+# Parâmetros gerais
+tamanhos_amostrais = c(10, 20, 30, 40, 50)
+
+# Função de rejeição para simplificação
+calcular_taxa_rejeicao <- function(est, quantis) {
+  sapply(quantis, function(qt) mean(est >= qt, na.rm = TRUE) * 100)
+}
+
+# Criar um data frame para armazenar os resultados
+resultados <- data.frame()
+
+# Loop do Monte Carlo
+for (n in tamanhos_amostrais) {
+
+  set.seed(33 + n) 
+  X = matrix(runif(n * p, min = -0.5, max = 0.5), n, p)
+
+  # Usando beta_verd definido no bloco '{r Vetor de parâmetros verdadeiros}'
+  eta_verd = X %*% beta_verd 
+  mi_verd = exp(eta_verd) / (1 + exp(eta_verd))
+
+  W = W_C = E = G = LR = numeric(REP)
+  beta_hat_storage = matrix(0, p, REP)
+
+  # Inicializar a barra de progresso para o valor atual de 'n'
+  message(paste0("\nIniciando simulações para n = ", n))
+  pb <- progress::progress_bar$new(
+    format = paste0("n=", n," replic: :current/:total [:bar] :percent ET: :eta"),
+    total = REP,
+    clear = FALSE, 
+    width = 80     
+  )
+
+  for (mc in 1:REP) {
+    pb$tick() # Atualiza a barra de progresso a cada iteração de 'mc'
+
+    set.seed(33 * mc * n)
+    theta = (1 - mi_verd) / mi_verd
+    Z = sapply(theta, function(th) rlindley_manual(1, th))
+    Y = Z / (1 + Z)
+
+    # --- MLE Irrestrito: beta_hat_mc ---
+    beta_inic <- tryCatch({
+        solve(t(X) %*% X) %*% t(X) %*% Y
+    }, error = function(e) {
+        if(ncol(X) > 0 && nrow(X) > 0) {
+            tryCatch({ ginv(t(X)%*%X) %*% t(X) %*% Y }, error = function(e2) { matrix(0, ncol(X), 1) })
+        } else { matrix(0, ncol(X), 1) }
+    })
+
+    optim_result_unrestricted <- optim(beta_inic, log_ver, NULL, method = "BFGS")
+    beta_hat_mc <- optim_result_unrestricted$par
+    beta_hat_storage[, mc] <- beta_hat_mc
+
+    # --- MLE Restrito: beta_tilde_mc ---
+    beta_tilde_mc <- numeric(p)
+    beta_tilde_mc[1:q] <- psi_H0
+
+    if (p > q) {
+      beta_2_inic <- beta_hat_mc[(q + 1):p]
+      optim_result_restricted <- optim(par = beta_2_inic, 
+                                       fn = log_ver_restricted, 
+                                       q_local = q, 
+                                       psi_H0_local = psi_H0, 
+                                       p_local = p,
+                                       method = "BFGS")
+      beta_tilde_mc[(q + 1):p] <- optim_result_restricted$par
+    }
+
+    # --- Estatísticas ---
+    W[mc]  <- Wald(beta_hat_mc, X, p, psi_H0)
+    LR[mc] <- Likeli_ratio_test_corrigida(beta_hat_mc, beta_tilde_mc, X, Y)
+    E[mc]  <- Escore_Test_Corrected(beta_tilde_mc, X, Y, q)
+    G[mc]  <- Gradiente_Test_Corrected(beta_hat_mc, beta_tilde_mc, X, Y, q, psi_H0) 
+
+    Cov_hat <- Cov_2_Matricial(beta_hat_mc, X, p, n)
+    W_C[mc] <- t(beta_hat_mc[1:q] - psi_H0) %*% solve(Cov_hat[1:q,1:q]) %*% (beta_hat_mc[1:q] - psi_H0)
+  } # Fim do loop 'mc'
+
+
+  quantis_vetor <- c(quantil99, quantil95, quantil90)
+
+  temp_resultados <- data.frame(
+    p_factor = as.factor(p),
+    n = as.factor(n),
+    Taxa_W_1  = calcular_taxa_rejeicao(W, quantis_vetor[1]),
+    Taxa_W_5  = calcular_taxa_rejeicao(W, quantis_vetor[2]),
+    Taxa_W_10 = calcular_taxa_rejeicao(W, quantis_vetor[3]),
+    Taxa_Wc_1 = calcular_taxa_rejeicao(W_C, quantis_vetor[1]),
+    Taxa_Wc_5 = calcular_taxa_rejeicao(W_C, quantis_vetor[2]),
+    Taxa_Wc_10= calcular_taxa_rejeicao(W_C, quantis_vetor[3]),
+    Taxa_LR_1 = calcular_taxa_rejeicao(LR2, quantis_vetor[1]),
+    Taxa_LR_5 = calcular_taxa_rejeicao(LR2, quantis_vetor[2]),
+    Taxa_LR_10= calcular_taxa_rejeicao(LR2, quantis_vetor[3]),
+    Taxa_E_1  = calcular_taxa_rejeicao(E, quantis_vetor[1]),
+    Taxa_E_5  = calcular_taxa_rejeicao(E, quantis_vetor[2]),
+    Taxa_E_10 = calcular_taxa_rejeicao(E, quantis_vetor[3]),
+    Taxa_G_1 = calcular_taxa_rejeicao(G, quantis_vetor[1]),
+    Taxa_G_5 = calcular_taxa_rejeicao(G, quantis_vetor[2]),
+    Taxa_G_10 = calcular_taxa_rejeicao(G, quantis_vetor[3])
+  )
+  resultados <- rbind(resultados, temp_resultados)
+} 
+
+print(resultados)
+```
+
+```{r Data frame dos resultados}
+# Criando o data.frame a partir dos dados da tabela LaTeX para q=1
+
+resultados_rejeicao_q1_completo <- data.frame(
+  p_factor = factor(rep(c(2, 3, 4, 5, 6), each = 5)),
+  n = factor(rep(c(10, 20, 30, 40, 50), times = 5)),
+  
+  # Wald (W)
+  Taxa_W_1  = c(2.19, 1.37, 1.23, 1.30, 1.12, # p=2
+                2.31, 1.43, 1.24, 1.27, 1.25, # p=3
+                2.65, 1.47, 1.27, 1.17, 1.31, # p=4
+                3.13, 1.76, 1.40, 1.51, 1.33, # p=5
+                2.62, 1.75, 1.67, 1.39, 1.28),# p=6
+  Taxa_W_5  = c(7.23, 5.74, 5.39, 5.47, 5.41,
+                7.40, 6.45, 6.14, 5.77, 5.69,
+                7.86, 6.57, 6.40, 5.78, 5.48,
+                8.85, 7.08, 5.74, 6.35, 5.63,
+                8.02, 6.80, 6.45, 6.28, 6.13),
+  Taxa_W_10 = c(12.34, 10.99, 11.29, 10.60, 10.61,
+                12.91, 12.01, 11.33, 10.93, 10.90,
+                14.09, 12.06, 11.89, 11.00, 11.13,
+                15.46, 12.04, 11.03, 11.78, 11.22,
+                14.00, 12.35, 11.74, 11.53, 11.24),
+  
+  # Wald Corrigido (Wc) 
+  Taxa_Wc_1 = c(1.34, 1.07, 0.91, 1.19, 1.01, # p=2  
+                1.28, 1.03, 0.96, 1.07, 1.09, # p=3  
+                1.38, 0.96, 0.98, 0.90, 1.13, # p=4  
+                1.74, 0.99, 0.98, 1.11, 0.98, # p=5  
+                1.23, 0.95, 0.93, 1.06, 1.08),# p=6  
+  Taxa_Wc_5 = c(5.02, 4.91, 4.80, 5.13, 5.03, # p=2  
+                5.05, 5.00, 5.19, 5.16, 5.20, # p=3  
+                5.03, 4.77, 5.24, 5.05, 4.84, # p=4  
+                5.56, 5.09, 4.57, 5.39, 4.84, # p=5  
+                4.90, 4.86, 5.00, 5.04, 5.35),# p=6  
+  Taxa_Wc_10= c(9.42, 9.70, 10.30, 9.98, 10.13,# p=2  
+                9.67, 10.06, 10.16, 9.94, 10.40,# p=3  
+                9.81, 9.89, 10.34, 9.96, 10.13,# p=4  
+                10.21, 9.81, 9.04, 10.49, 9.98, # p=5  
+                9.31, 9.64, 9.48, 9.92, 10.36),# p=6  
+
+  # Razão de Verossimilhança (LR2)
+  Taxa_LR2_1= c(1.18, 0.81, 0.87, 1.05, 1.00, # p=2  
+                1.20, 0.95, 0.90, 0.83, 1.03, # p=3  
+                1.22, 0.71, 0.95, 0.69, 1.05, # p=4  
+                1.17, 0.73, 0.89, 1.04, 0.88, # p=5  
+                1.38, 0.85, 0.67, 0.85, 0.92),# p=6  
+  Taxa_LR2_5= c(5.32, 4.75, 4.77, 4.88, 5.01, # p=2  
+                5.37, 4.80, 4.80, 4.86, 5.12, # p=3  
+                5.28, 4.46, 4.74, 4.89, 4.66, # p=4  
+                5.12, 4.66, 4.07, 5.19, 4.49, # p=5  
+                5.90, 4.56, 4.39, 4.73, 4.87),# p=6  
+  Taxa_LR2_10=c(10.22, 9.50, 9.79, 9.94, 9.79, # p=2  
+                10.52, 9.61, 9.63, 9.91, 9.96, # p=3  
+                10.77, 9.37, 9.67, 9.74, 9.64, # p=4  
+                10.26, 9.32, 8.70, 10.21, 9.60, # p=5  
+                11.27, 9.51, 8.61, 9.64, 9.64),# p=6  
+  
+  # Escore (E)
+  Taxa_E_1  = c(0.87, 1.11, 1.03, 1.08, 1.23,
+                0.72, 0.90, 1.09, 0.90, 1.13,
+                0.55, 0.66, 0.98, 0.63, 1.02,
+                0.43, 0.36, 0.78, 1.00, 0.77,
+                0.63, 0.45, 0.62, 0.68, 0.79),
+  Taxa_E_5  = c(3.51, 4.73, 4.86, 4.66, 4.91,
+                3.58, 3.91, 4.37, 4.44, 5.04,
+                3.04, 3.50, 4.14, 4.08, 4.34,
+                2.50, 3.22, 3.37, 4.47, 4.06,
+                2.98, 2.86, 3.41, 3.65, 4.19),
+  Taxa_E_10 = c(7.36, 9.10, 9.32, 9.56, 9.56,
+                7.73, 8.30, 8.86, 9.11, 9.48,
+                6.90, 7.76, 8.62, 8.76, 8.92,
+                5.93, 6.86, 7.28, 8.82, 8.53,
+                7.45, 7.08, 6.86, 7.93, 8.44),
+
+  # Gradiente (G)
+  Taxa_G_1  = c(1.05, 0.91, 0.96, 1.10, 1.05,
+                1.10, 0.96, 0.98, 0.86, 1.08,
+                1.08, 0.79, 1.01, 0.72, 1.09,
+                0.95, 0.73, 0.96, 1.07, 0.91,
+                1.20, 0.82, 0.74, 0.88, 0.98),
+  Taxa_G_5  = c(5.08, 4.95, 4.87, 4.94, 5.06,
+                5.27, 4.80, 4.90, 4.93, 5.21,
+                5.10, 4.69, 4.87, 4.85, 4.78,
+                4.80, 4.64, 4.19, 5.14, 4.63,
+                5.38, 4.52, 4.52, 4.74, 4.90),
+  Taxa_G_10 = c(9.92, 9.68, 9.98, 9.99, 9.84,
+                10.10, 9.73, 9.74, 10.00, 9.99,
+                10.40, 9.45, 9.81, 9.82, 9.65,
+                9.79, 9.29, 8.84, 10.27, 9.66,
+                10.78, 9.51, 8.86, 9.59, 9.71)
+)
+
+# Para verificar a estrutura do data frame:
+
+#print(str(resultados_rejeicao_q1_completo))
+#print(head(resultados_rejeicao_q1_completo))
+```
+
+```{r Função para calcular o Viés }
+
+calcular_vies_taxa_rejeicao <- function(taxa_empirica_perc, nivel_nominal_perc) {
+  vies <- taxa_empirica_perc - nivel_nominal_perc
+  return(vies)
+}
+
+# Criar um novo data frame para armazenar os vieses
+resultados_vies_q1_completo <- resultados_rejeicao_q1_completo[, c("p_factor", "n")]
+
+# Identificar as colunas que contêm as taxas de rejeição
+colunas_taxas_nomes <- names(resultados_rejeicao_q1_completo)[!names(resultados_rejeicao_q1_completo) %in% c("p_factor", "n")]
+
+# Calcular o Viés para cada coluna de taxa
+for (col_nome_taxa_atual in colunas_taxas_nomes) {
+  nivel_nominal <- NA
+  if (grepl("_1$", col_nome_taxa_atual)) { nivel_nominal <- 1 }
+  else if (grepl("_5$", col_nome_taxa_atual)) { nivel_nominal <- 5 }
+  else if (grepl("_10$", col_nome_taxa_atual)) { nivel_nominal <- 10 }
+  
+  if (!is.na(nivel_nominal)) {
+    col_nome_vies_novo <- paste0("Vies_", sub("Taxa_", "", col_nome_taxa_atual))
+    resultados_vies_q1_completo[[col_nome_vies_novo]] <- calcular_vies_taxa_rejeicao(
+      taxa_empirica_perc = resultados_rejeicao_q1_completo[[col_nome_taxa_atual]],
+      nivel_nominal_perc = nivel_nominal
+    )
+  }
+}
+
+# Visualizar os resultados do Viés
+print(head(resultados_vies_q1_completo)) # Imprime as primeiras linhas
+# Para arredondar e imprimir:
+# colunas_numericas_vies <- names(resultados_vies_q1_completo)[sapply(resultados_vies_q1_completo, is.numeric)]
+# resultados_vies_para_impressao <- resultados_vies_q1_completo
+# resultados_vies_para_impressao[colunas_numericas_vies] <- round(resultados_vies_para_impressao[colunas_numericas_vies], 3)
+# print(resultados_vies_para_impressao)
+```
+
+
+
+
+
+
+
